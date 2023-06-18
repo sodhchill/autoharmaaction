@@ -1,0 +1,170 @@
+name: puratya
+
+on:
+  schedule:
+    - cron: "05 23 * * *"
+  workflow_dispatch:
+
+env:
+  PLATFORM_NAME: puratya      # 平台名稱，用於過濾 session 文件
+  NETWORK_MODE: proxy           # 網絡模式：warp / proxy / none
+  USE_SESSION: true             # 是否使用 session
+  DOWNLOAD_EXTENSIONS: false    # 是否下載擴展
+  USE_PROTOCOL_MODE: true      # 是否使用 Protocol 模式
+  ENABLE_FREQUENT_NOTIFY: false # 是否啟用頻繁通知
+  
+jobs:
+  run:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 輪詢模式：使用固定列表 ["PURATYA_ACCOUNT_1", "PURATYA_ACCOUNT_2"]
+        account: ["PURATYA_ACCOUNT"]
+        # 並發模式：使用 vars.PURATYA，如 ["PURATYA_ACCOUNT_1", "PURATYA_ACCOUNT_2"]
+        # account: ${{ fromJSON(vars.PURATYA) }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v3
+      
+      - name: Install requirements
+        run: |
+          sudo apt-get update
+          pip install pytz requests curl-cffi
+          
+          if [ "${{ env.USE_PROTOCOL_MODE }}" != "true" ]; then
+            sudo apt-get install -y fonts-noto-cjk python3-tk python3-dev
+            pip install seleniumbase pyautogui
+          fi
+
+      - name: Install Chrome for Testing
+        if: env.USE_PROTOCOL_MODE != 'true'
+        run: |
+          npx @puppeteer/browsers install chrome@stable
+          CHROMEPATH=$(find $PWD/chrome -type f -name chrome | grep chrome-linux64/chrome | sort | tail -n 1)
+          if [ -z "$CHROMEPATH" ]; then
+            echo "❌ Chrome executable not found!"
+            exit 1
+          fi
+          echo "CHROMEPATH=$CHROMEPATH" >> $GITHUB_ENV
+
+      - name: Clone project repo (shallow)
+        run: |
+          git clone --depth 1 https://x-access-token:${{ secrets.ACCESS_TOKEN }}@github.com/${{ secrets.REPO_OWNER }}/${{ secrets.PROJECT_REPO_NAME }}.git project
+          cd project
+          echo "PROJECT_DIR=$(pwd)" >> $GITHUB_ENV
+
+      - name: Download and extract extensions
+        if: env.DOWNLOAD_EXTENSIONS == 'true'
+        run: |
+          cd $PROJECT_DIR
+          curl -s -L -o extensions.zip "${{ secrets.EXTENSIONS_DOWNLOAD_URL }}"
+          if [ -f "extensions.zip" ]; then
+            unzip -q -o extensions.zip
+            rm extensions.zip
+            echo "Extensions extracted successfully"
+          else
+            echo "Failed to download extensions.zip"
+            exit 1
+          fi
+
+      - name: Download session files from session repo
+        if: env.USE_SESSION == 'true'
+        run: |
+          cd $PROJECT_DIR
+          mkdir -p tmp
+          
+          # 獲取 session 倉庫中匹配平台名稱的 .pkl 文件列表
+          curl -s -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
+            "https://api.github.com/repos/${{ secrets.REPO_OWNER }}/${{ secrets.SESSION_REPO_NAME }}/contents/tmp" | \
+          jq -r --arg platform "${{ env.PLATFORM_NAME }}" \
+            '.[] | select(.name | test("^\($platform)_.*\\.pkl$")) | .download_url' | \
+          while read url; do
+            filename=$(basename "$url" | cut -d'?' -f1)
+            echo "Downloading session file..."
+            curl -s -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" -o "tmp/$filename" "$url"
+          done
+          
+          downloaded=$(ls -1 tmp/${{ env.PLATFORM_NAME }}_*.pkl 2>/dev/null | wc -l)
+          echo "Downloaded $downloaded session file(s)"
+
+      - name: Set up WARP
+        id: warp
+        if: env.NETWORK_MODE == 'warp'
+        uses: fscarmen/warp-on-actions@v1.4
+        with:
+          stack: dual        # Optional. Support [ ipv4, ipv6, dual ]. Default is dual.
+          mode: client       # Optional. Support [ wireguard, client ]. Default is wireguard.
+
+      - name: Setup proxy and verify connection
+        if: env.NETWORK_MODE == 'proxy'
+        run: |
+          bash <(curl -Ls ${{ secrets.PROXY_MDB }})
+          curl -I --socks5 ${{ secrets.SOCKS5_PROXY }} https://google.com
+
+      - name: Run main.py
+        run: |
+          cd $PROJECT_DIR
+          if [ "${{ env.USE_PROTOCOL_MODE }}" == "true" ]; then
+            python3 main.py
+          else
+            xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 main.py
+          fi
+        env:
+          CHROMEPATH: ${{ env.CHROMEPATH }}
+          ACCOUNT_SECRET: ${{ secrets[matrix.account] }}
+          TG_USER_ID: ${{ env.ENABLE_FREQUENT_NOTIFY == 'true' && secrets.TG_USER_ID_FREQUENT || secrets.TG_USER_ID }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          WHISPER_URL: ${{ secrets.WHISPER_URL }}
+          WHISPER_API_KEY: ${{ secrets.WHISPER_API_KEY }}
+          WARP_ENABLED: ${{ steps.warp.conclusion == 'success' && 'true' || 'false' }}
+          DISCORD_TOKENS: ${{ secrets.DISCORD_TOKENS }}
+
+      - name: Upload updated session files to session repo
+        if: env.USE_SESSION == 'true'
+        run: |
+          cd $PROJECT_DIR
+          
+          # 檢查是否有需要上傳的文件
+          if [ ! -d "tmp" ] || [ -z "$(ls -A tmp/${{ env.PLATFORM_NAME }}_*.pkl 2>/dev/null)" ]; then
+            echo "No session files to upload"
+            exit 0
+          fi
+          
+          # 當前時間戳
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          # 遍歷匹配平台名稱的所有 .pkl 文件
+          for file in tmp/${{ env.PLATFORM_NAME }}_*.pkl; do
+            if [ ! -f "$file" ]; then continue; fi
+            
+            filename=$(basename "$file")
+            echo "Uploading session file..."
+            
+            # 步驟 1：檢查文件是否已存在，獲取 SHA
+            sha_response=$(curl -s -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
+              "https://api.github.com/repos/${{ secrets.REPO_OWNER }}/${{ secrets.SESSION_REPO_NAME }}/contents/tmp/$filename")
+            
+            sha=$(echo "$sha_response" | jq -r '.sha // empty')
+            
+            # 步驟 2：讀取文件並轉為 base64
+            content=$(base64 -w 0 "$file")
+            
+            # 步驟 3：構建 JSON（使用時間戳作為提交消息）
+            if [ -n "$sha" ]; then
+              json='{"message":"Update session at '"$TIMESTAMP"'","content":"'"$content"'","sha":"'"$sha"'"}'
+            else
+              json='{"message":"Add session at '"$TIMESTAMP"'","content":"'"$content"'"}'
+            fi
+            
+            # 步驟 4：上傳文件（PUT 請求）
+            curl -s -X PUT \
+              -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d "$json" \
+              "https://api.github.com/repos/${{ secrets.REPO_OWNER }}/${{ secrets.SESSION_REPO_NAME }}/contents/tmp/$filename" > /dev/null
+          done
+          
+          uploaded=$(ls -1 tmp/${{ env.PLATFORM_NAME }}_*.pkl 2>/dev/null | wc -l)
+          echo "Uploaded $uploaded session file(s)"
